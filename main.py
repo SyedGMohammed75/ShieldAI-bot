@@ -4,7 +4,7 @@ import json
 import mysql.connector
 import speech_recognition as sr
 import httpx
-import asyncio
+import google.generativeai as genai
 from pydub import AudioSegment
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -22,7 +22,8 @@ DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_NAME = os.getenv("DB_NAME")
 OPENWEATHERMAP_API_KEY = os.getenv("OPENWEATHERMAP_API_KEY")
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL") # This is needed for Webhooks
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 # --- Logging ---
 logging.basicConfig(
@@ -30,14 +31,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Onboarding Questions ---
-ONBOARDING_QUESTIONS = [
-    "What is your full name?",
-    "What is your date of birth (DD-MM-YYYY)?",
-    "What is your primary occupation?",
-    "Where are you located (City, State)?",
-    "What is your monthly income?",
-]
+# --- Gemini Setup ---
+genai.configure(api_key=GOOGLE_API_KEY)
+model = genai.GenerativeModel('gemini-1.5-flash')
+
+SYSTEM_PROMPT = """
+You are ShieldAI, a friendly and professional conversational AI insurance agent. 
+Your goal is to help workers get insured quickly and easily. 
+You need to collect the following 5 pieces of information from the user:
+1. Full Name
+2. Date of Birth (DD-MM-YYYY)
+3. Primary Occupation
+4. Location (City, State)
+5. Monthly Income
+
+Be conversational, helpful, and empathetic. Don't just ask them like a form; engage with them.
+If they ask questions about insurance, answer them clearly.
+Once you have ALL 5 pieces of information, output a JSON object at the very end of your message in this format:
+DATA_CAPTURED: {"full_name": "...", "dob": "...", "occupation": "...", "location": "...", "income": "..."}
+"""
 
 # --- Database ---
 def get_db_connection():
@@ -48,7 +60,7 @@ def get_db_connection():
             user=DB_USER,
             password=DB_PASSWORD,
             database=DB_NAME,
-            ssl_disabled=False # TiDB Cloud requires SSL
+            ssl_disabled=False
         )
         return conn
     except mysql.connector.Error as e:
@@ -68,7 +80,7 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    cursor.execute("CREATE TABLE IF NOT EXISTS user_onboarding_state (user_id BIGINT PRIMARY KEY, onboarding_step INT, answers JSON)")
+    cursor.execute("CREATE TABLE IF NOT EXISTS chat_history (user_id BIGINT PRIMARY KEY, history JSON)")
     conn.commit()
     cursor.close()
     conn.close()
@@ -87,51 +99,66 @@ async def get_weather(city: str) -> str:
             logger.error(f"Weather error: {e}")
             return f"Couldn't fetch weather for {city}."
 
+# --- AI Logic ---
+async def get_ai_response(user_id: int, user_message: str) -> str:
+    conn = get_db_connection()
+    if not conn: return "Sorry, I'm having trouble connecting to my brain right now."
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT history FROM chat_history WHERE user_id = %s", (user_id,))
+    row = cursor.fetchone()
+    
+    history = json.loads(row['history']) if row else []
+    
+    # Simple history management for Gemini
+    chat = model.start_chat(history=history)
+    response = chat.send_message(f"{SYSTEM_PROMPT}\n\nUser: {user_message}")
+    
+    # Update history
+    new_history = []
+    for content in chat.history:
+        new_history.append({"role": content.role, "parts": [p.text for p in content.parts]})
+        
+    cursor.execute("REPLACE INTO chat_history (user_id, history) VALUES (%s, %s)", (user_id, json.dumps(new_history)))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    
+    return response.text
+
 # --- Telegram Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.message.from_user.id
     conn = get_db_connection()
-    if not conn: return
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM user_onboarding_state WHERE user_id = %s", (user_id,))
-    cursor.execute("INSERT INTO user_onboarding_state (user_id, onboarding_step, answers) VALUES (%s, %s, %s)", (user_id, 0, json.dumps({})))
-    conn.commit()
-    cursor.close()
-    conn.close()
-    await update.message.reply_text("Welcome to ShieldAI! Let's get you insured in 60 seconds.\n\nFirst question: What is your full name?")
-
-async def ask_next_question(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.message.from_user.id
-    conn = get_db_connection()
-    if not conn: return
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM user_onboarding_state WHERE user_id = %s", (user_id,))
-    user_state = cursor.fetchone()
-    if user_state:
-        step = user_state['onboarding_step']
-        if step < len(ONBOARDING_QUESTIONS):
-            await update.message.reply_text(ONBOARDING_QUESTIONS[step])
-        else:
-            await complete_onboarding(update, context)
-    cursor.close()
-    conn.close()
+    if conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM chat_history WHERE user_id = %s", (user_id,))
+        conn.commit()
+        cursor.close()
+        conn.close()
+    
+    response = await get_ai_response(user_id, "Hi! I want to get insured.")
+    await update.message.reply_text(response.split("DATA_CAPTURED:")[0].strip())
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.message.from_user.id
-    conn = get_db_connection()
-    if not conn: return
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM user_onboarding_state WHERE user_id = %s", (user_id,))
-    user_state = cursor.fetchone()
-    if user_state:
-        step = user_state['onboarding_step']
-        answers = json.loads(user_state['answers'])
-        answers[ONBOARDING_QUESTIONS[step]] = update.message.text
-        cursor.execute("UPDATE user_onboarding_state SET onboarding_step = %s, answers = %s WHERE user_id = %s", (step + 1, json.dumps(answers), user_id))
-        conn.commit()
-        await ask_next_question(update, context)
-    cursor.close()
-    conn.close()
+    user_text = update.message.text
+    
+    ai_response = await get_ai_response(user_id, user_text)
+    
+    if "DATA_CAPTURED:" in ai_response:
+        parts = ai_response.split("DATA_CAPTURED:")
+        text_msg = parts[0].strip()
+        data_json = parts[1].strip()
+        
+        try:
+            data = json.loads(data_json)
+            await update.message.reply_text(text_msg)
+            await complete_onboarding(update, data)
+        except Exception as e:
+            logger.error(f"JSON parsing error: {e}")
+            await update.message.reply_text(ai_response)
+    else:
+        await update.message.reply_text(ai_response)
 
 async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     voice = update.message.voice
@@ -156,22 +183,20 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
         for f in [ogg_filename, wav_filename]:
             if os.path.exists(f): os.remove(f)
 
-async def complete_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def complete_onboarding(update: Update, data: dict) -> None:
     user_id = update.message.from_user.id
     conn = get_db_connection()
     if not conn: return
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM user_onboarding_state WHERE user_id = %s", (user_id,))
-    user_state = cursor.fetchone()
-    if user_state:
-        answers = json.loads(user_state['answers'])
-        cursor.execute("INSERT INTO policies (user_id, full_name, date_of_birth, occupation, location, monthly_income) VALUES (%s, %s, %s, %s, %s, %s)",
-                       (user_id, answers.get(ONBOARDING_QUESTIONS[0]), answers.get(ONBOARDING_QUESTIONS[1]), answers.get(ONBOARDING_QUESTIONS[2]), answers.get(ONBOARDING_QUESTIONS[3]), answers.get(ONBOARDING_QUESTIONS[4])))
-        cursor.execute("DELETE FROM user_onboarding_state WHERE user_id = %s", (user_id,))
-        conn.commit()
-        await update.message.reply_text("Policy saved! Coverage active.")
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO policies (user_id, full_name, date_of_birth, occupation, location, monthly_income) VALUES (%s, %s, %s, %s, %s, %s)",
+        (user_id, data.get('full_name'), data.get('dob'), data.get('occupation'), data.get('location'), data.get('income'))
+    )
+    cursor.execute("DELETE FROM chat_history WHERE user_id = %s", (user_id,))
+    conn.commit()
     cursor.close()
     conn.close()
+    await update.message.reply_text("Policy saved! Your coverage is now active. ShieldAI is here for you. 🛡️")
 
 async def test_rain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     location = "Bengaluru,IN"
