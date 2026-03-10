@@ -1,0 +1,10 @@
+C:\Users\psych\ShieldAI-bot\venv\Lib\site-packages\pydub\utils.py:170: RuntimeWarning: Couldn't find ffmpeg or avconv - defaulting to ffmpeg, but may not work
+  warn("Couldn't find ffmpeg or avconv - defaulting to ffmpeg, but may not work", RuntimeWarning)
+2026-03-08 15:44:33,829 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8532830549:AAHbzKj2MDoWC3IUqX_RX4zmmqvTgknb75E/getMe "HTTP/1.1 200 OK"
+2026-03-08 15:44:34,004 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8532830549:AAHbzKj2MDoWC3IUqX_RX4zmmqvTgknb75E/deleteWebhook "HTTP/1.1 200 OK"
+2026-03-08 15:44:34,020 - apscheduler.scheduler - INFO - Scheduler started
+2026-03-08 15:44:34,020 - telegram.ext.Application - INFO - Application started
+2026-03-08 15:44:34,532 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8532830549:AAHbzKj2MDoWC3IUqX_RX4zmmqvTgknb75E/getUpdates "HTTP/1.1 200 OK"
+2026-03-08 15:44:34,899 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8532830549:AAHbzKj2MDoWC3IUqX_RX4zmmqvTgknb75E/sendMessage "HTTP/1.1 200 OK"
+2026-03-08 15:44:35,409 - httpx - INFO - HTTP Request: GET http://api.openweathermap.org/data/2.5/weather?q=Bengaluru,IN&appid=55912f66ab68a06a31c13f04bcd3b4dd "HTTP/1.1 200 OK"
+2026-03-08 15:44:35,791 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8532830549:AAHbzKj2MDoWC3IUqX_RX4zmmqvTgknb75E/sendMessage "HTTP/1.1 200 OK"
