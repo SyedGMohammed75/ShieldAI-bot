@@ -44,10 +44,11 @@ def get_db_connection():
     try:
         conn = mysql.connector.connect(
             host=DB_HOST,
-            port=int(DB_PORT) if DB_PORT else 3306,
+            port=int(DB_PORT) if DB_PORT else 4000,
             user=DB_USER,
             password=DB_PASSWORD,
-            database=DB_NAME
+            database=DB_NAME,
+            ssl_disabled=False # TiDB Cloud requires SSL
         )
         return conn
     except mysql.connector.Error as e:
