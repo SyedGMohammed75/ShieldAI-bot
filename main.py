@@ -47,7 +47,7 @@ You need to collect the following 5 pieces of information from the user:
 
 Be conversational, helpful, and empathetic. Don't just ask them like a form; engage with them.
 If they ask questions about insurance, answer them clearly.
-Once you have ALL 5 pieces of information, output a JSON object at the very end of your message in this format:
+Once you have ALL 5 pieces of information, output a JSON object at the very end of your message in this EXACT format:
 DATA_CAPTURED: {"full_name": "...", "dob": "...", "occupation": "...", "location": "...", "income": "..."}
 """
 
@@ -102,31 +102,41 @@ async def get_weather(city: str) -> str:
 # --- AI Logic ---
 async def get_ai_response(user_id: int, user_message: str) -> str:
     conn = get_db_connection()
-    if not conn: return "Sorry, I'm having trouble connecting to my brain right now."
+    if not conn: return "Sorry, I'm having trouble connecting to my database."
     cursor = conn.cursor(dictionary=True)
     cursor.execute("SELECT history FROM chat_history WHERE user_id = %s", (user_id,))
     row = cursor.fetchone()
     
-    history = json.loads(row['history']) if row else []
+    # Format history for Gemini
+    history = []
+    if row:
+        stored_history = json.loads(row['history'])
+        for h in stored_history:
+            history.append({"role": h["role"], "parts": [h["parts"][0]]})
     
-    # Simple history management for Gemini
     chat = model.start_chat(history=history)
-    response = chat.send_message(f"{SYSTEM_PROMPT}\n\nUser: {user_message}")
+    # Include system prompt in the first message if history is empty
+    prompt = f"{SYSTEM_PROMPT}\n\nUser: {user_message}" if not history else user_message
     
-    # Update history
-    new_history = []
-    for content in chat.history:
-        new_history.append({"role": content.role, "parts": [p.text for p in content.parts]})
-        
-    cursor.execute("REPLACE INTO chat_history (user_id, history) VALUES (%s, %s)", (user_id, json.dumps(new_history)))
-    conn.commit()
-    cursor.close()
-    conn.close()
-    
-    return response.text
+    try:
+        response = chat.send_message(prompt)
+        # Update and save history
+        new_history = []
+        for content in chat.history:
+            new_history.append({"role": content.role, "parts": [p.text for p in content.parts]})
+            
+        cursor.execute("REPLACE INTO chat_history (user_id, history) VALUES (%s, %s)", (user_id, json.dumps(new_history)))
+        conn.commit()
+        return response.text
+    except Exception as e:
+        logger.error(f"Gemini error: {e}")
+        return "I'm sorry, I'm having a bit of a brain fog. Can you repeat that?"
+    finally:
+        cursor.close()
+        conn.close()
 
 # --- Telegram Handlers ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.message.from_user.id
     conn = get_db_connection()
     if conn:
@@ -136,7 +146,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         cursor.close()
         conn.close()
     
-    response = await get_ai_response(user_id, "Hi! I want to get insured.")
+    response = await get_ai_response(user_id, "Hello! I'm interested in insurance.")
     await update.message.reply_text(response.split("DATA_CAPTURED:")[0].strip())
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -152,7 +162,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         try:
             data = json.loads(data_json)
-            await update.message.reply_text(text_msg)
+            if text_msg: await update.message.reply_text(text_msg)
             await complete_onboarding(update, data)
         except Exception as e:
             logger.error(f"JSON parsing error: {e}")
@@ -178,7 +188,7 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await handle_text_message(update, context)
     except Exception as e:
         logger.error(f"Voice error: {e}")
-        await update.message.reply_text("Voice error. Needs ffmpeg.")
+        await update.message.reply_text("Voice error. I might need ffmpeg installed on the server.")
     finally:
         for f in [ogg_filename, wav_filename]:
             if os.path.exists(f): os.remove(f)
@@ -188,15 +198,19 @@ async def complete_onboarding(update: Update, data: dict) -> None:
     conn = get_db_connection()
     if not conn: return
     cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO policies (user_id, full_name, date_of_birth, occupation, location, monthly_income) VALUES (%s, %s, %s, %s, %s, %s)",
-        (user_id, data.get('full_name'), data.get('dob'), data.get('occupation'), data.get('location'), data.get('income'))
-    )
-    cursor.execute("DELETE FROM chat_history WHERE user_id = %s", (user_id,))
-    conn.commit()
-    cursor.close()
-    conn.close()
-    await update.message.reply_text("Policy saved! Your coverage is now active. ShieldAI is here for you. 🛡️")
+    try:
+        cursor.execute(
+            "INSERT INTO policies (user_id, full_name, date_of_birth, occupation, location, monthly_income) VALUES (%s, %s, %s, %s, %s, %s)",
+            (user_id, data.get('full_name'), data.get('dob'), data.get('occupation'), data.get('location'), data.get('income'))
+        )
+        cursor.execute("DELETE FROM chat_history WHERE user_id = %s", (user_id,))
+        conn.commit()
+        await update.message.reply_text("Your policy has been saved successfully! ShieldAI has you covered. 🛡️")
+    except Exception as e:
+        logger.error(f"Database save error: {e}")
+    finally:
+        cursor.close()
+        conn.close()
 
 async def test_rain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     location = "Bengaluru,IN"
@@ -205,12 +219,12 @@ async def test_rain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(weather_report)
 
 async def test_claim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Zero-click claim simulated: ₹450 credited.")
+    await update.message.reply_text("Zero-click claim simulated: ₹450 credited to your account.")
 
 # --- FastAPI Setup ---
 app = FastAPI()
 application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("start", start_command))
 application.add_handler(CommandHandler("testrain", test_rain))
 application.add_handler(CommandHandler("testclaim", test_claim))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
@@ -238,3 +252,9 @@ async def set_webhook():
     webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
     success = await application.bot.set_webhook(webhook_url)
     return {"status": "webhook set", "url": webhook_url, "success": success}
+
+if __name__ == "__main__":
+    # For local testing if not using uvicorn
+    import asyncio
+    init_db()
+    application.run_polling()
