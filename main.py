@@ -35,29 +35,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Gemini Setup ---
+if not GOOGLE_API_KEY:
+    logger.error("CRITICAL: GOOGLE_API_KEY is not set in environment variables!")
+
 genai.configure(api_key=GOOGLE_API_KEY)
 model = genai.GenerativeModel('gemini-1.5-flash')
 
 SYSTEM_PROMPT = """
-You are ShieldAI, a highly specialized AI Insurance Agent for gig workers (delivery partners, drivers, etc.). 
-Your specialty is 'Parametric Rain Protection'. 
-
-HOW IT WORKS:
-- If it rains heavily in the worker's location, they get an instant payout. No forms, no proof of loss. 
-- We track the weather via satellites and IoT sensors.
-- Coverage costs ₹99/week. Payout is ₹450 per disruption.
+You are ShieldAI, a friendly and professional conversational AI insurance agent for gig workers. 
+Your goal is to help workers get 'Parametric Rain Protection'.
+Premium is ₹99/week. Payout is ₹450 per disruption.
 
 YOUR TASKS:
-1. ONBOARDING: Naturally collect: Full Name, DOB, Occupation, Location, and Monthly Income.
-2. EDUCATION: Explain why gig workers need this. (Income loss during rain, safety, etc.)
-3. CLAIMS: If a user mentions it's raining or wants money, you MUST check the weather first (the system will provide it to you). 
-4. PREMIUMS: Tell them their premium is ₹99/week based on their profile.
-
-STYLE: Professional, empathetic, and Indian-gig-worker-friendly. Use a mix of English and 'Hinglish' if appropriate.
-
-IMPORTANT:
-- Once you have the 5 onboarding details, output: DATA_CAPTURED: {"full_name": "...", "dob": "...", "occupation": "...", "location": "...", "income": "..."}
-- If a user wants to claim, and weather data shows rain, output: CLAIM_TRIGGERED: {"amount": 450, "reason": "Heavy Rain Detected"}
+1. Naturally collect: Full Name, Date of Birth (DD-MM-YYYY), Primary Occupation, Location (City, State), and Monthly Income.
+2. Explain the benefits of rain insurance for workers.
+3. Once you have ALL 5 onboarding details, output exactly: DATA_CAPTURED: {"full_name": "...", "dob": "...", "occupation": "...", "location": "...", "income": "..."}
 """
 
 # --- Database ---
@@ -72,7 +64,7 @@ def get_db_connection():
             ssl_disabled=False
         )
         return conn
-    except mysql.connector.Error as e:
+    except Exception as e:
         logger.error(f"Database connection error: {e}")
         return None
 
@@ -95,57 +87,46 @@ def init_db():
     cursor.close()
     conn.close()
 
-# --- Weather ---
-async def get_weather_data(city: str) -> str:
-    if not OPENWEATHERMAP_API_KEY: return "Weather system unavailable."
-    url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={OPENWEATHERMAP_API_KEY}"
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(url)
-            data = response.json()
-            main = data['weather'][0]['main']
-            desc = data['weather'][0]['description']
-            return f"Current Weather in {city}: {main} ({desc})"
-        except:
-            return "Unable to verify weather at this moment."
-
 # --- AI Logic ---
 async def get_ai_response(user_id: str, user_message: str) -> str:
     conn = get_db_connection()
-    if not conn: return "Database offline."
+    if not conn: return "Database connection error. Please try again later."
+    
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT history FROM chat_history WHERE user_id = %s", (user_id,))
-    row = cursor.fetchone()
-    
-    # Get Location if they are already onboarded
-    cursor.execute("SELECT location FROM policies WHERE user_id = %s", (user_id,))
-    policy = cursor.fetchone()
-    location_context = ""
-    if policy:
-        weather = await get_weather_data(policy['location'])
-        location_context = f"\n[SYSTEM CONTEXT: User Location is {policy['location']}. {weather}]"
-
-    history = []
-    if row:
-        stored_history = json.loads(row['history'])
-        for h in stored_history:
-            history.append({"role": h["role"], "parts": [h["parts"][0]]})
-    
-    chat = model.start_chat(history=history)
-    # The brain now gets the weather context automatically
-    prompt = f"{SYSTEM_PROMPT}{location_context}\n\nUser: {user_message}"
-    
     try:
-        response = chat.send_message(prompt)
+        cursor.execute("SELECT history FROM chat_history WHERE user_id = %s", (user_id,))
+        row = cursor.fetchone()
+        
+        # Format history for Gemini
+        history = []
+        if row and row['history']:
+            try:
+                stored_history = json.loads(row['history'])
+                for h in stored_history:
+                    # Validate format
+                    if "role" in h and "parts" in h:
+                        history.append({"role": h["role"], "parts": [str(h["parts"][0])]})
+            except Exception as e:
+                logger.error(f"Error parsing history: {e}")
+
+        chat = model.start_chat(history=history)
+        
+        # If it's a new chat, prefix with system prompt
+        full_message = f"{SYSTEM_PROMPT}\n\nUser: {user_message}" if not history else user_message
+        
+        response = chat.send_message(full_message)
+        
+        # Save new history
         new_history = []
         for content in chat.history:
             new_history.append({"role": content.role, "parts": [p.text for p in content.parts]})
+            
         cursor.execute("REPLACE INTO chat_history (user_id, history) VALUES (%s, %s)", (user_id, json.dumps(new_history)))
         conn.commit()
         return response.text
     except Exception as e:
-        logger.error(f"Gemini error: {e}")
-        return "I'm experiencing a bit of a delay. Could you say that again?"
+        logger.error(f"AI ERROR for user {user_id}: {e}")
+        return "I'm having a bit of trouble thinking right now. Please try again in a moment."
     finally:
         cursor.close()
         conn.close()
@@ -164,19 +145,31 @@ async def home(request: Request):
 
 @app.post("/chat")
 async def chat_endpoint(req: ChatRequest):
-    ai_response = await get_ai_response(req.userId, req.message)
-    
-    # Process Actions
-    if "DATA_CAPTURED:" in ai_response:
-        data = json.loads(ai_response.split("DATA_CAPTURED:")[1].strip())
-        await save_policy(req.userId, data)
-    
-    if "CLAIM_TRIGGERED:" in ai_response:
-        # In a real app, this would call Razorpay
-        pass
+    if req.message == "/start":
+        await reset_user(req.userId)
+        msg = "Hello! I want to learn about ShieldAI."
+    else:
+        msg = req.message
 
-    clean_response = ai_response.split("DATA_CAPTURED:")[0].split("CLAIM_TRIGGERED:")[0].strip()
+    ai_response = await get_ai_response(req.userId, msg)
+    
+    if "DATA_CAPTURED:" in ai_response:
+        try:
+            data = json.loads(ai_response.split("DATA_CAPTURED:")[1].strip())
+            await save_policy(req.userId, data)
+        except: pass
+    
+    clean_response = ai_response.split("DATA_CAPTURED:")[0].strip()
     return {"reply": clean_response}
+
+async def reset_user(user_id):
+    conn = get_db_connection()
+    if conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM chat_history WHERE user_id = %s", (user_id,))
+        conn.commit()
+        cursor.close()
+        conn.close()
 
 async def save_policy(user_id, data):
     conn = get_db_connection()
@@ -193,19 +186,27 @@ async def save_policy(user_id, data):
 # --- Telegram ---
 application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-async def handle_tg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = str(update.message.from_user.id)
+    await reset_user(user_id)
+    response = await get_ai_response(user_id, "Hello! I want to get insured.")
+    await update.message.reply_text(response.split("DATA_CAPTURED:")[0].strip())
+
+async def handle_tg_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.message.from_user.id)
     ai_response = await get_ai_response(user_id, update.message.text)
     
     if "DATA_CAPTURED:" in ai_response:
-        data = json.loads(ai_response.split("DATA_CAPTURED:")[1].strip())
-        await save_policy(user_id, data)
+        try:
+            data = json.loads(ai_response.split("DATA_CAPTURED:")[1].strip())
+            await save_policy(user_id, data)
+        except: pass
     
-    clean_msg = ai_response.split("DATA_CAPTURED:")[0].split("CLAIM_TRIGGERED:")[0].strip()
+    clean_msg = ai_response.split("DATA_CAPTURED:")[0].strip()
     await update.message.reply_text(clean_msg)
 
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tg))
-application.add_handler(CommandHandler("start", handle_tg)) # Treat start as a message
+application.add_handler(CommandHandler("start", start_command))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tg_text))
 
 @app.on_event("startup")
 async def on_startup():
@@ -223,7 +224,7 @@ async def webhook(request: Request):
 async def set_webhook():
     webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
     await application.bot.set_webhook(webhook_url)
-    return {"status": "webhook set"}
+    return {"status": "webhook set", "url": webhook_url}
 
 if __name__ == "__main__":
     import uvicorn
