@@ -117,19 +117,21 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
     
     chat = model.start_chat(history=history)
     prompt = f"{SYSTEM_PROMPT}\n\nUser: {user_message}" if not history else user_message
-    
     try:
         response = chat.send_message(prompt)
         new_history = []
         for content in chat.history:
             new_history.append({"role": content.role, "parts": [p.text for p in content.parts]})
-            
+
         cursor.execute("REPLACE INTO chat_history (user_id, history) VALUES (%s, %s)", (user_id, json.dumps(new_history)))
         conn.commit()
         return response.text
     except Exception as e:
-        logger.error(f"Gemini error: {e}")
+        logger.error(f"DETAILED GEMINI ERROR: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
         return "I'm sorry, I'm having a bit of a brain fog. Can you repeat that?"
+
     finally:
         cursor.close()
         conn.close()
