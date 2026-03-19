@@ -40,8 +40,8 @@ if not TELEGRAM_BOT_TOKEN:
 
 # --- Gemini Setup ---
 genai.configure(api_key=GOOGLE_API_KEY)
-# Use the stable model name (not 'latest' suffix which can break)
-model = genai.GenerativeModel('gemini-1.5-flash')
+# gemini-2.0-flash is the current stable model available on all API keys
+model = genai.GenerativeModel('gemini-2.0-flash')
 
 SYSTEM_PROMPT = """
 You are ShieldAI, a friendly and professional conversational AI insurance agent. 
