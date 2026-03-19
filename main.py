@@ -5,14 +5,12 @@ import mysql.connector
 import speech_recognition as sr
 import httpx
 import google.generativeai as genai
+import uvicorn
 from pydub import AudioSegment
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from pydantic import BaseModel
 
 # Load environment variables
 load_dotenv()
@@ -27,6 +25,7 @@ DB_NAME = os.getenv("DB_NAME")
 OPENWEATHERMAP_API_KEY = os.getenv("OPENWEATHERMAP_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
+PORT = int(os.environ.get("PORT", 8000)) # Render provides this
 
 # --- Logging ---
 logging.basicConfig(
@@ -35,21 +34,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Gemini Setup ---
-if not GOOGLE_API_KEY:
-    logger.error("CRITICAL: GOOGLE_API_KEY is not set in environment variables!")
-
 genai.configure(api_key=GOOGLE_API_KEY)
 model = genai.GenerativeModel('gemini-1.5-flash')
 
 SYSTEM_PROMPT = """
-You are ShieldAI, a friendly and professional conversational AI insurance agent for gig workers. 
-Your goal is to help workers get 'Parametric Rain Protection'.
-Premium is ₹99/week. Payout is ₹450 per disruption.
+You are ShieldAI, a friendly and professional conversational AI insurance agent. 
+Your goal is to help workers get insured quickly and easily. 
+You need to collect the following 5 pieces of information from the user:
+1. Full Name
+2. Date of Birth (DD-MM-YYYY)
+3. Primary Occupation
+4. Location (City, State)
+5. Monthly Income
 
-YOUR TASKS:
-1. Naturally collect: Full Name, Date of Birth (DD-MM-YYYY), Primary Occupation, Location (City, State), and Monthly Income.
-2. Explain the benefits of rain insurance for workers.
-3. Once you have ALL 5 onboarding details, output exactly: DATA_CAPTURED: {"full_name": "...", "dob": "...", "occupation": "...", "location": "...", "income": "..."}
+Be conversational, helpful, and empathetic. Don't just ask them like a form; engage with them.
+If they ask questions about insurance, answer them clearly.
+Once you have ALL 5 pieces of information, output a JSON object at the very end of your message in this EXACT format:
+DATA_CAPTURED: {"full_name": "...", "dob": "...", "occupation": "...", "location": "...", "income": "..."}
 """
 
 # --- Database ---
@@ -64,7 +65,7 @@ def get_db_connection():
             ssl_disabled=False
         )
         return conn
-    except Exception as e:
+    except mysql.connector.Error as e:
         logger.error(f"Database connection error: {e}")
         return None
 
@@ -75,48 +76,50 @@ def init_db():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS policies (
             id INT AUTO_INCREMENT PRIMARY KEY,
-            user_id VARCHAR(255) NOT NULL, full_name VARCHAR(255),
+            user_id BIGINT NOT NULL, full_name VARCHAR(255),
             date_of_birth VARCHAR(255), occupation VARCHAR(255),
             location VARCHAR(255), monthly_income VARCHAR(255),
-            status VARCHAR(50) DEFAULT 'ACTIVE',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    cursor.execute("CREATE TABLE IF NOT EXISTS chat_history (user_id VARCHAR(255) PRIMARY KEY, history JSON)")
+    cursor.execute("CREATE TABLE IF NOT EXISTS chat_history (user_id BIGINT PRIMARY KEY, history JSON)")
     conn.commit()
     cursor.close()
     conn.close()
 
-# --- AI Logic ---
-async def get_ai_response(user_id: str, user_message: str) -> str:
-    conn = get_db_connection()
-    if not conn: return "Database connection error. Please try again later."
-    
-    cursor = conn.cursor(dictionary=True)
-    try:
-        cursor.execute("SELECT history FROM chat_history WHERE user_id = %s", (user_id,))
-        row = cursor.fetchone()
-        
-        # Format history for Gemini
-        history = []
-        if row and row['history']:
-            try:
-                stored_history = json.loads(row['history'])
-                for h in stored_history:
-                    # Validate format
-                    if "role" in h and "parts" in h:
-                        history.append({"role": h["role"], "parts": [str(h["parts"][0])]})
-            except Exception as e:
-                logger.error(f"Error parsing history: {e}")
+# --- Weather ---
+async def get_weather(city: str) -> str:
+    if not OPENWEATHERMAP_API_KEY: return "Weather API key not configured."
+    url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={OPENWEATHERMAP_API_KEY}"
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(url)
+            response.raise_for_status()
+            data = response.json()
+            return f"The weather in {city} is {data['weather'][0]['main']} ({data['weather'][0]['description']})."
+        except Exception as e:
+            logger.error(f"Weather error: {e}")
+            return f"Couldn't fetch weather for {city}."
 
-        chat = model.start_chat(history=history)
-        
-        # If it's a new chat, prefix with system prompt
-        full_message = f"{SYSTEM_PROMPT}\n\nUser: {user_message}" if not history else user_message
-        
-        response = chat.send_message(full_message)
-        
-        # Save new history
+# --- AI Logic ---
+async def get_ai_response(user_id: int, user_message: str) -> str:
+    conn = get_db_connection()
+    if not conn: return "Sorry, I'm having trouble connecting to my database."
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT history FROM chat_history WHERE user_id = %s", (user_id,))
+    row = cursor.fetchone()
+    
+    history = []
+    if row:
+        stored_history = json.loads(row['history'])
+        for h in stored_history:
+            history.append({"role": h["role"], "parts": [h["parts"][0]]})
+    
+    chat = model.start_chat(history=history)
+    prompt = f"{SYSTEM_PROMPT}\n\nUser: {user_message}" if not history else user_message
+    
+    try:
+        response = chat.send_message(prompt)
         new_history = []
         for content in chat.history:
             new_history.append({"role": content.role, "parts": [p.text for p in content.parts]})
@@ -125,44 +128,15 @@ async def get_ai_response(user_id: str, user_message: str) -> str:
         conn.commit()
         return response.text
     except Exception as e:
-        logger.error(f"AI ERROR for user {user_id}: {e}")
-        return "I'm having a bit of trouble thinking right now. Please try again in a moment."
+        logger.error(f"Gemini error: {e}")
+        return "I'm sorry, I'm having a bit of a brain fog. Can you repeat that?"
     finally:
         cursor.close()
         conn.close()
 
-# --- FastAPI & UI ---
-app = FastAPI()
-templates = Jinja2Templates(directory="templates")
-
-class ChatRequest(BaseModel):
-    userId: str
-    message: str
-
-@app.get("/", response_class=HTMLResponse)
-async def home(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
-
-@app.post("/chat")
-async def chat_endpoint(req: ChatRequest):
-    if req.message == "/start":
-        await reset_user(req.userId)
-        msg = "Hello! I want to learn about ShieldAI."
-    else:
-        msg = req.message
-
-    ai_response = await get_ai_response(req.userId, msg)
-    
-    if "DATA_CAPTURED:" in ai_response:
-        try:
-            data = json.loads(ai_response.split("DATA_CAPTURED:")[1].strip())
-            await save_policy(req.userId, data)
-        except: pass
-    
-    clean_response = ai_response.split("DATA_CAPTURED:")[0].strip()
-    return {"reply": clean_response}
-
-async def reset_user(user_id):
+# --- Telegram Handlers ---
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.message.from_user.id
     conn = get_db_connection()
     if conn:
         cursor = conn.cursor()
@@ -170,43 +144,88 @@ async def reset_user(user_id):
         conn.commit()
         cursor.close()
         conn.close()
+    
+    response = await get_ai_response(user_id, "Hello! I'm interested in insurance.")
+    await update.message.reply_text(response.split("DATA_CAPTURED:")[0].strip())
 
-async def save_policy(user_id, data):
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.message.from_user.id
+    user_text = update.message.text
+    ai_response = await get_ai_response(user_id, user_text)
+    
+    if "DATA_CAPTURED:" in ai_response:
+        parts = ai_response.split("DATA_CAPTURED:")
+        text_msg = parts[0].strip()
+        data_json = parts[1].strip()
+        try:
+            data = json.loads(data_json)
+            if text_msg: await update.message.reply_text(text_msg)
+            await complete_onboarding(update, data)
+        except Exception as e:
+            logger.error(f"JSON error: {e}")
+            await update.message.reply_text(ai_response)
+    else:
+        await update.message.reply_text(ai_response)
+
+async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    voice = update.message.voice
+    file = await voice.get_file()
+    ogg_filename = f"{file.file_id}.ogg"
+    wav_filename = f"{file.file_id}.wav"
+    await file.download_to_drive(ogg_filename)
+    try:
+        audio = AudioSegment.from_ogg(ogg_filename)
+        audio.export(wav_filename, format="wav")
+        r = sr.Recognizer()
+        with sr.AudioFile(wav_filename) as source:
+            audio_data = r.record(source)
+            text = r.recognize_google(audio_data)
+            await update.message.reply_text(f"I heard: '{text}'")
+            update.message.text = text
+            await handle_text_message(update, context)
+    except Exception as e:
+        logger.error(f"Voice error: {e}")
+        await update.message.reply_text("Voice error. Needs ffmpeg.")
+    finally:
+        for f in [ogg_filename, wav_filename]:
+            if os.path.exists(f): os.remove(f)
+
+async def complete_onboarding(update: Update, data: dict) -> None:
+    user_id = update.message.from_user.id
     conn = get_db_connection()
     if not conn: return
     cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO policies (user_id, full_name, date_of_birth, occupation, location, monthly_income) VALUES (%s, %s, %s, %s, %s, %s)",
-        (user_id, data.get('full_name'), data.get('dob'), data.get('occupation'), data.get('location'), data.get('income'))
-    )
-    conn.commit()
-    cursor.close()
-    conn.close()
+    try:
+        cursor.execute(
+            "INSERT INTO policies (user_id, full_name, date_of_birth, occupation, location, monthly_income) VALUES (%s, %s, %s, %s, %s, %s)",
+            (user_id, data.get('full_name'), data.get('dob'), data.get('occupation'), data.get('location'), data.get('income'))
+        )
+        cursor.execute("DELETE FROM chat_history WHERE user_id = %s", (user_id,))
+        conn.commit()
+        await update.message.reply_text("Policy saved! Coverage active. 🛡️")
+    except Exception as e:
+        logger.error(f"Save error: {e}")
+    finally:
+        cursor.close()
+        conn.close()
 
-# --- Telegram ---
+async def test_rain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    location = "Bengaluru,IN"
+    await update.message.reply_text(f"Checking weather for {location}...")
+    weather_report = await get_weather(location)
+    await update.message.reply_text(weather_report)
+
+async def test_claim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Zero-click claim simulated: ₹450 credited.")
+
+# --- FastAPI Setup ---
+app = FastAPI()
 application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = str(update.message.from_user.id)
-    await reset_user(user_id)
-    response = await get_ai_response(user_id, "Hello! I want to get insured.")
-    await update.message.reply_text(response.split("DATA_CAPTURED:")[0].strip())
-
-async def handle_tg_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = str(update.message.from_user.id)
-    ai_response = await get_ai_response(user_id, update.message.text)
-    
-    if "DATA_CAPTURED:" in ai_response:
-        try:
-            data = json.loads(ai_response.split("DATA_CAPTURED:")[1].strip())
-            await save_policy(user_id, data)
-        except: pass
-    
-    clean_msg = ai_response.split("DATA_CAPTURED:")[0].strip()
-    await update.message.reply_text(clean_msg)
-
 application.add_handler(CommandHandler("start", start_command))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tg_text))
+application.add_handler(CommandHandler("testrain", test_rain))
+application.add_handler(CommandHandler("testclaim", test_claim))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
 
 @app.on_event("startup")
 async def on_startup():
@@ -220,12 +239,17 @@ async def webhook(request: Request):
     await application.process_update(update)
     return {"status": "ok"}
 
+@app.get("/")
+async def root():
+    return {"message": "ShieldAI is online"}
+
 @app.get("/set-webhook")
 async def set_webhook():
+    if not RENDER_EXTERNAL_URL: return {"error": "RENDER_EXTERNAL_URL not set"}
     webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
-    await application.bot.set_webhook(webhook_url)
-    return {"status": "webhook set", "url": webhook_url}
+    success = await application.bot.set_webhook(webhook_url)
+    return {"status": "webhook set", "url": webhook_url, "success": success}
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # This ensures it runs correctly both locally and on Render
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
