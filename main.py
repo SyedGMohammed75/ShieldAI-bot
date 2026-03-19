@@ -3,7 +3,6 @@ import logging
 import json
 import mysql.connector
 import httpx
-import google.generativeai as genai
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -22,7 +21,7 @@ DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_NAME = os.getenv("DB_NAME")
 OPENWEATHERMAP_API_KEY = os.getenv("OPENWEATHERMAP_API_KEY")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 PORT = int(os.environ.get("PORT", 8000))
 
@@ -33,15 +32,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Validate critical env vars on startup ---
-if not GOOGLE_API_KEY:
-    logger.critical("GOOGLE_API_KEY is not set! The AI will not work.")
+if not OPENROUTER_API_KEY:
+    logger.critical("OPENROUTER_API_KEY is not set! The AI will not work.")
 if not TELEGRAM_BOT_TOKEN:
     logger.critical("TELEGRAM_BOT_TOKEN is not set!")
 
-# --- Gemini Setup ---
-genai.configure(api_key=GOOGLE_API_KEY)
-# gemini-2.0-flash is the current stable model available on all API keys
-model = genai.GenerativeModel('gemini-2.0-flash')
+OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 
 SYSTEM_PROMPT = """
 You are ShieldAI, a friendly and professional conversational AI insurance agent. 
@@ -97,7 +93,7 @@ def init_db():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS chat_history (
             user_id BIGINT PRIMARY KEY,
-            history JSON
+            history TEXT
         )
     """)
     conn.commit()
@@ -147,32 +143,53 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
         cursor.execute("SELECT history FROM chat_history WHERE user_id = %s", (user_id,))
         row = cursor.fetchone()
 
-        history = []
+        # Build messages array for OpenRouter (OpenAI format)
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
         if row and row['history']:
             stored_history = json.loads(row['history'])
             for h in stored_history:
-                history.append({"role": h["role"], "parts": [h["parts"][0]]})
+                messages.append({"role": h["role"], "content": h["content"]})
 
-        chat = model.start_chat(history=history)
-        prompt = f"{SYSTEM_PROMPT}\n\nUser: {user_message}" if not history else user_message
+        messages.append({"role": "user", "content": user_message})
 
-        response = chat.send_message(prompt)
+        # Call OpenRouter API
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://shieldai-bot.onrender.com",
+                    "X-Title": "ShieldAI"
+                },
+                json={
+                    "model": OPENROUTER_MODEL,
+                    "messages": messages,
+                    "max_tokens": 1000
+                },
+                timeout=30
+            )
+            response.raise_for_status()
+            data = response.json()
+            ai_text = data["choices"][0]["message"]["content"]
 
+        # Save updated history to DB
         new_history = []
-        for content in chat.history:
-            new_history.append({"role": content.role, "parts": [p.text for p in content.parts]})
+        for m in messages[1:]:  # skip system prompt
+            new_history.append({"role": m["role"], "content": m["content"]})
+        new_history.append({"role": "assistant", "content": ai_text})
 
         cursor.execute(
             "REPLACE INTO chat_history (user_id, history) VALUES (%s, %s)",
             (user_id, json.dumps(new_history))
         )
         conn.commit()
-        return response.text
+        return ai_text
 
     except Exception as e:
-        # Log the FULL error so you can see it in Render logs
         import traceback
-        logger.error(f"Gemini API error for user {user_id}: {type(e).__name__}: {str(e)}")
+        logger.error(f"OpenRouter API error for user {user_id}: {type(e).__name__}: {str(e)}")
         logger.error(traceback.format_exc())
         return "I'm sorry, I'm having a bit of a brain fog. Can you repeat that?"
 
