@@ -6,6 +6,8 @@ import httpx
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -178,6 +180,7 @@ async def morning_weather_check():
             except Exception as e:
                 logger.error(f"Failed to send alert to {user['user_id']}: {e}")
 
+# --- Telegram Handlers ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.message.from_user.id
     conn = get_db_connection()
@@ -245,7 +248,16 @@ async def test_rain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def test_claim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("✅ Zero-click claim simulated: ₹450 has been credited to your wallet!")
 
+# --- FastAPI App ---
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 application.add_handler(CommandHandler("start", start_command))
 application.add_handler(CommandHandler("testrain", test_rain))
@@ -286,6 +298,73 @@ async def set_webhook():
     webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
     success = await application.bot.set_webhook(webhook_url)
     return {"status": "webhook set", "url": webhook_url, "success": success}
+
+# --- Web Chat API ---
+class ChatMessage(BaseModel):
+    session_id: str
+    message: str
+
+@app.post("/api/chat")
+async def web_chat(body: ChatMessage):
+    # Use a large fixed user_id offset so web users don't clash with Telegram users
+    web_user_id = abs(hash(body.session_id)) % (10**12) + 9_000_000_000_000
+    ai_response = await get_ai_response(web_user_id, body.message)
+
+    policy_saved = False
+    reply = ai_response
+
+    if "DATA_CAPTURED:" in ai_response:
+        parts = ai_response.split("DATA_CAPTURED:")
+        reply = parts[0].strip()
+        try:
+            data = json.loads(parts[1].strip())
+            conn = get_db_connection()
+            if conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT INTO policies (user_id, full_name, date_of_birth, occupation, location, monthly_income) VALUES (%s, %s, %s, %s, %s, %s)",
+                    (web_user_id, data.get('full_name'), data.get('dob'), data.get('occupation'), data.get('location'), data.get('income'))
+                )
+                cursor.execute("DELETE FROM chat_history WHERE user_id = %s", (web_user_id,))
+                conn.commit()
+                cursor.close()
+                conn.close()
+                policy_saved = True
+                name = data.get('full_name', 'there')
+                reply += f"\n\n🎉 Welcome to ShieldAI, {name}! Your policy is now active. You're covered for weather-related work disruptions. 🛡️"
+        except Exception as e:
+            logger.error(f"Web onboarding error: {e}")
+
+    return {"reply": reply, "policy_saved": policy_saved}
+
+@app.post("/api/chat/reset")
+async def reset_chat(body: dict):
+    session_id = body.get("session_id", "")
+    web_user_id = abs(hash(session_id)) % (10**12) + 9_000_000_000_000
+    conn = get_db_connection()
+    if conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM chat_history WHERE user_id = %s", (web_user_id,))
+        conn.commit()
+        cursor.close()
+        conn.close()
+    return {"status": "reset"}
+
+# --- Admin API ---
+@app.get("/api/admin/policies")
+async def get_policies():
+    conn = get_db_connection()
+    if not conn:
+        return {"error": "DB connection failed"}
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT id, user_id, full_name, date_of_birth, occupation, location, monthly_income, created_at FROM policies ORDER BY created_at DESC")
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    for row in rows:
+        if row.get('created_at'):
+            row['created_at'] = str(row['created_at'])
+    return {"policies": rows, "total": len(rows)}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
