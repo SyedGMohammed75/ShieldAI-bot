@@ -36,8 +36,8 @@ if not TELEGRAM_BOT_TOKEN:
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
 SYSTEM_PROMPT = """
-You are ShieldAI, a friendly and professional conversational AI insurance agent. 
-Your goal is to help workers get insured quickly and easily. 
+You are ShieldAI, a friendly and professional conversational AI protection agent. 
+Your goal is to help workers get covered quickly and easily. 
 You need to collect the following 5 pieces of information from the user:
 1. Full Name
 2. Date of Birth (DD-MM-YYYY)
@@ -46,7 +46,7 @@ You need to collect the following 5 pieces of information from the user:
 5. Monthly Income
 
 Be conversational, helpful, and empathetic. Don't just ask them like a form; engage with them.
-If they ask questions about insurance, answer them clearly.
+If they ask questions about coverage or protection, answer them clearly.
 
 VERY IMPORTANT RULES:
 - Ask for ONLY ONE piece of information per message. Never ask two questions at once.
@@ -55,6 +55,7 @@ VERY IMPORTANT RULES:
 - Monthly Income MUST be explicitly provided by the user before you output DATA_CAPTURED.
 - Do NOT output DATA_CAPTURED until you have received ALL 5 pieces of information directly from the user.
 - If income is missing, ask for it before proceeding.
+- Never use the words "insurance" or "policy" — always say "coverage" or "protection" instead.
 
 Once you have ALL 5 pieces of information confirmed, output a JSON object at the very end of your message in this EXACT format:
 DATA_CAPTURED: {"full_name": "...", "dob": "...", "occupation": "...", "location": "...", "income": "..."}
@@ -238,9 +239,9 @@ async def complete_onboarding(update: Update, data: dict) -> None:
         conn.commit()
         name = data.get('full_name', 'there')
         await update.message.reply_text(
-            f"🎉 Welcome to ShieldAI, {name}!\n\n✅ Your policy is now active.\n"
-            f"🛡️ You're covered for weather-related work disruptions.\n"
-            f"💰 Payouts happen automatically — no claims to file!\n\n"
+            f"🎉 Welcome to ShieldAI, {name}!\n\n✅ Your coverage is now active.\n"
+            f"🛡️ You're protected from weather-related work disruptions.\n"
+            f"💰 Payouts happen automatically — no filing needed!\n\n"
             f"I'll message you every morning if rain is expected. Stay safe!"
         )
     except Exception as e:
@@ -340,7 +341,7 @@ async def web_chat(body: ChatMessage):
                 conn.close()
                 policy_saved = True
                 name = data.get('full_name', 'there')
-                reply += f"\n\n🎉 Welcome to ShieldAI, {name}! Your policy is now active. You're covered for weather-related work disruptions. 🛡️"
+                reply += f"\n\n🎉 Welcome to ShieldAI, {name}! Your coverage is now active. You're protected from weather-related work disruptions. 🛡️"
         except Exception as e:
             logger.error(f"Web onboarding error: {e}")
 
